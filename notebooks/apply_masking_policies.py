@@ -3,7 +3,7 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Apply Unity Catalog ABAC Masking Policies
+# MAGIC # Apply Unity Catalog ABAC Masking Policies & Catalog Tags
 # MAGIC
 # MAGIC Reads `masking_config` Delta table and idempotently applies `CREATE OR REPLACE POLICY`
 # MAGIC statements for each active PII column type.
@@ -12,6 +12,12 @@
 # MAGIC - Pass a single catalog name → applies policies to that catalog only
 # MAGIC - Pass a comma-separated list (e.g. `cat_a,cat_b,cat_c`) → applies to each listed catalog
 # MAGIC - Pass `ALL` (default) → discovers all non-system catalogs and applies to each
+# MAGIC
+# MAGIC **Catalog tagging (optional):**
+# MAGIC - Pass `tag_key_value_pairs` as a comma-separated string of `key:value` pairs
+# MAGIC - Positional mapping: first catalog gets first tag, second catalog gets second tag, etc.
+# MAGIC - Example: catalogs=`cat_a,cat_b` + tags=`org:fb_product_solutions,org:sb_gmad`
+# MAGIC   → `cat_a` tagged with `org = fb_product_solutions`, `cat_b` tagged with `org = sb_gmad`
 
 # COMMAND ----------
 
@@ -22,25 +28,28 @@ dbutils.widgets.text("config_catalog", "dg_metadata_catalog", "Config Catalog")
 dbutils.widgets.text("schema", "db_metadata_masking", "Schema")
 dbutils.widgets.text("masking_function", "dg_metadata_catalog.db_metadata_masking.masking_function", "Masking UDF")
 dbutils.widgets.dropdown("force_reapply", "false", ["true", "false"], "Force re-apply existing policies")
+dbutils.widgets.text("tag_key_value_pairs", "", "Catalog Tags (comma-separated key:value pairs, positional with catalogs)")
 
-catalog_param    = dbutils.widgets.get("catalog").strip()
-exclude_catalogs = {c.strip().lower() for c in dbutils.widgets.get("exclude_catalogs").split(",") if c.strip()}
-config_catalog   = dbutils.widgets.get("config_catalog")
-schema           = dbutils.widgets.get("schema")
-masking_function = dbutils.widgets.get("masking_function")
-force_reapply    = dbutils.widgets.get("force_reapply").lower() == "true"
+catalog_param       = dbutils.widgets.get("catalog").strip()
+exclude_catalogs    = {c.strip().lower() for c in dbutils.widgets.get("exclude_catalogs").split(",") if c.strip()}
+config_catalog      = dbutils.widgets.get("config_catalog")
+schema              = dbutils.widgets.get("schema")
+masking_function    = dbutils.widgets.get("masking_function")
+force_reapply       = dbutils.widgets.get("force_reapply").lower() == "true"
+tag_kvp_param       = dbutils.widgets.get("tag_key_value_pairs").strip()
 
 # Derive environment from workspace URL (e.g. nyl-builder-dev.cloud.databricks.com → dev)
 workspace_url = spark.conf.get("spark.databricks.workspaceUrl")
 env = workspace_url.split(".")[0].split("-")[-1]
 
-print(f"Target Catalog   : {catalog_param}")
-print(f"Exclude Catalogs : {exclude_catalogs}")
-print(f"Config Catalog   : {config_catalog}")
-print(f"Schema           : {schema}")
-print(f"Masking Function : {masking_function}")
-print(f"Force Re-apply   : {force_reapply}")
-print(f"Environment      : {env} (from workspace URL: {workspace_url})")
+print(f"Target Catalog      : {catalog_param}")
+print(f"Exclude Catalogs    : {exclude_catalogs}")
+print(f"Config Catalog      : {config_catalog}")
+print(f"Schema              : {schema}")
+print(f"Masking Function    : {masking_function}")
+print(f"Force Re-apply      : {force_reapply}")
+print(f"Tag Key-Value Pairs : {tag_kvp_param if tag_kvp_param else '(none)'}")
+print(f"Environment         : {env} (from workspace URL: {workspace_url})")
 
 # COMMAND ----------
 
@@ -200,6 +209,75 @@ for catalog in target_catalogs:
 
 # COMMAND ----------
 
+# DBTITLE 1,Apply catalog tags (optional)
+tag_results = []
+
+if tag_kvp_param:
+    tag_pairs = [t.strip() for t in tag_kvp_param.split(",") if t.strip()]
+
+    if catalog_param.upper() == "ALL":
+        if len(tag_pairs) != 1:
+            raise ValueError(
+                f"When catalog=ALL, supply exactly one tag (applied to every catalog). "
+                f"Got {len(tag_pairs)} tags."
+            )
+        catalog_tag_map = [(cat, tag_pairs[0]) for cat in target_catalogs]
+    else:
+        if len(tag_pairs) != len(target_catalogs):
+            raise ValueError(
+                f"Positional mismatch: {len(target_catalogs)} catalog(s) but {len(tag_pairs)} tag(s). "
+                f"Catalogs: {target_catalogs}, Tags: {tag_pairs}"
+            )
+        catalog_tag_map = list(zip(target_catalogs, tag_pairs))
+
+    print(f"\n{'='*60}")
+    print(f"CATALOG TAGGING")
+    print(f"{'='*60}")
+
+    for catalog, kvp in catalog_tag_map:
+        if ":" not in kvp:
+            error_msg = f"Invalid tag format '{kvp}' — expected 'key:value'"
+            print(f"  {catalog}: {error_msg}")
+            tag_results.append({
+                "col_name": f"TAG:{kvp}",
+                "catalog_name": catalog,
+                "environment": env,
+                "action": "FAILED",
+                "policy_sql": None,
+                "error_message": error_msg,
+            })
+            continue
+
+        tag_key, tag_value = kvp.split(":", 1)
+        tag_key = tag_key.strip()
+        tag_value = tag_value.strip()
+        tag_sql = f"ALTER CATALOG `{catalog}` SET TAGS ('{tag_key}' = '{tag_value}')"
+
+        try:
+            spark.sql(tag_sql)
+            action = "TAG_APPLIED"
+            error_message = None
+            print(f"  {catalog}: {tag_key} = {tag_value}")
+        except Exception as e:
+            action = "TAG_FAILED"
+            error_message = str(e)[:2000]
+            print(f"  {catalog}: FAILED — {error_message}")
+
+        tag_results.append({
+            "col_name": f"TAG:{tag_key}:{tag_value}",
+            "catalog_name": catalog,
+            "environment": env,
+            "action": action,
+            "policy_sql": tag_sql,
+            "error_message": error_message,
+        })
+
+    results.extend(tag_results)
+else:
+    print("\nNo tag_key_value_pairs provided — skipping catalog tagging.")
+
+# COMMAND ----------
+
 # DBTITLE 1,Write audit log
 from pyspark.sql.types import StructType, StructField, StringType
 from pyspark.sql.functions import current_user, current_timestamp
@@ -227,9 +305,12 @@ display(audit_df)
 # COMMAND ----------
 
 # DBTITLE 1,Summary
-failed  = [r for r in results if r["action"] == "FAILED"]
-applied = [r for r in results if r["action"] == "APPLIED"]
-skipped = [r for r in results if r["action"] == "SKIPPED"]
+failed       = [r for r in results if r["action"] == "FAILED"]
+applied      = [r for r in results if r["action"] == "APPLIED"]
+skipped      = [r for r in results if r["action"] == "SKIPPED"]
+tags_applied = [r for r in results if r["action"] == "TAG_APPLIED"]
+tags_failed  = [r for r in results if r["action"] == "TAG_FAILED"]
+all_failures = failed + tags_failed
 
 print(f"\n{'='*60}")
 print(f"SUMMARY")
@@ -239,16 +320,18 @@ print(f"Environment       : {env}")
 print(f"Policies applied  : {len(applied)}")
 print(f"Policies skipped  : {len(skipped)}")
 print(f"Policies failed   : {len(failed)}")
+print(f"Tags applied      : {len(tags_applied)}")
+print(f"Tags failed       : {len(tags_failed)}")
 
-if failed:
-    print(f"\nFailed policies:")
-    for f_item in failed:
+if all_failures:
+    print(f"\nFailures:")
+    for f_item in all_failures:
         print(f"  - {f_item['catalog_name']}.{f_item['col_name']}: {f_item['error_message'][:100]}")
-    msg = f"{len(failed)} of {len(results)} policies failed across {len(target_catalogs)} catalogs."
+    msg = f"{len(all_failures)} of {len(results)} operations failed across {len(target_catalogs)} catalogs."
     print(f"\n{msg}")
     # Optionally raise to fail the DABs job and trigger email notification
     # dbutils.notebook.exit(msg)
 else:
-    msg = f"SUCCESS: {len(applied)} policies applied across {len(target_catalogs)} catalogs"
+    msg = f"SUCCESS: {len(applied)} policies applied, {len(tags_applied)} tags applied across {len(target_catalogs)} catalogs"
     print(f"\n{msg}")
     dbutils.notebook.exit(msg)

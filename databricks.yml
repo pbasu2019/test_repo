@@ -4,7 +4,7 @@
 ## Deploys:
 ##   1. Masking UDF          (deploy-time, via run_as SQL hook)
 ##   2. Config + audit tables (deploy-time, via run_as SQL hook)
-##   3. Daily job             (applies masking policies only)
+##   3. Daily job             (applies masking policies + optional catalog tags)
 ##
 ## Pre-requisites (manual, one-time, by admin):
 ##   databricks secrets create-scope masking
@@ -44,6 +44,9 @@ variables:
   force_reapply:
     description: "Force re-apply existing policies (true/false)"
     default: "false"
+  tag_key_value_pairs:
+    description: "Optional comma-separated tag key:value pairs applied positionally to catalogs (e.g. org:fb_product_solutions,class_sensitivity:internal)"
+    default: ""
   warehouse_id:
     description: "Databricks SQL Warehouse ID for deploy-time DDL tasks"
 
@@ -137,6 +140,7 @@ resources:
       name: "[${bundle.target}] UC Masking Policy Manager"
       description: >
         Daily job. Reads masking_config and applies ABAC column-masking policies.
+        Optionally applies UC catalog-level tags via the 'tag_key_value_pairs' parameter.
         Supports single-catalog or all-catalog deployment via the 'catalog' parameter.
       tags:
         team: data-governance
@@ -162,6 +166,7 @@ resources:
               schema: ${var.schema}
               masking_function: ${var.masking_function}
               force_reapply: ${var.force_reapply}
+              tag_key_value_pairs: ${var.tag_key_value_pairs}
             source: WORKSPACE
 
       email_notifications:
