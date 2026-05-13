@@ -1,0 +1,173 @@
+## ---------------------------------------------------------------------------
+## Databricks Asset Bundle (DABs) – Unity Catalog ABAC Masking Policy Manager
+## ---------------------------------------------------------------------------
+## Deploys:
+##   1. Masking UDF          (deploy-time, via run_as SQL hook)
+##   2. Config + audit tables (deploy-time, via run_as SQL hook)
+##   3. Daily job             (applies masking policies only)
+##
+## Pre-requisites (manual, one-time, by admin):
+##   databricks secrets create-scope masking
+##   databricks secrets put-secret --scope masking --key pii-salt --string-value "<random-salt>"
+##
+## Catalog behavior:
+##   - Pass a specific catalog name to target one catalog
+##   - Pass "ALL" (or leave default) to discover and apply across all catalogs
+##
+## Usage:
+##   databricks bundle validate -t dev
+##   databricks bundle deploy  -t dev       # runs DDL once at deploy time
+##   databricks bundle run masking_policy_manager -t dev
+## ---------------------------------------------------------------------------
+
+bundle:
+  name: masking_policy_manager
+workspace:
+  #root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target} #/Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+  host: https://nyl-builder-dev.cloud.databricks.com/
+variables:
+  catalog:
+    description: "Target catalog. Use a specific name or 'ALL' to apply across all catalogs."
+    default: ALL
+  config_catalog:
+    description: "Catalog where masking_config and masking_audit_log tables live"
+    default: dg_metadata_catalog
+  schema:
+    description: "Schema (database) for masking config and audit tables"
+    default: db_metadata_masking
+  masking_function:
+    description: "Default masking UDF path"
+    default: dg_metadata_catalog.db_metadata_masking.masking_function
+  exclude_catalogs:
+    description: "Comma-separated list of catalogs to exclude when catalog=ALL"
+    default: "system,hive_metastore,__databricks_internal,samples"
+  force_reapply:
+    description: "Force re-apply existing policies (true/false)"
+    default: "false"
+  warehouse_id:
+    description: "Databricks SQL Warehouse ID for deploy-time DDL tasks"
+
+targets:
+  dev:
+    #mode: production
+    default: true
+    variables:
+      config_catalog: dev_builder_governance #dg_masking_metadata_catalog_pb
+      catalog: dev_builder_governance #dev_builder_enterprise_silver #target_masking_catalog_pb
+      schema: db_metadata_masking
+      #masking_function: ${var.config_catalog}.${var.schema}.masking_function
+      exclude_catalogs: "system,hive_metastore,__databricks_internal,samples"
+  qa:
+    variables:
+      config_catalog: dg_metadata_catalog_qa
+
+  prod:
+    mode: production
+    variables:
+      config_catalog: dg_metadata_catalog
+    run_as:
+      service_principal_name: sp-masking-policy-deployer
+
+## ---------------------------------------------------------------------------
+## Deploy-time DDL jobs
+## Run once on `bundle deploy` via triggers, not on a schedule
+## ---------------------------------------------------------------------------
+resources:
+    # -------------------------------------------------------------------------
+    # Provide READ access to the secrets for all users
+    # -------------------------------------------------------------------------
+  secret_scopes:
+    masking_scope:
+      name: masking
+      permissions:
+        - group_name: "users"
+          level: "READ"
+  jobs:
+    # -------------------------------------------------------------------------
+    # Deploy-time Setup Job: Create masking UDF + config tables (in order)
+    # Run once after `bundle deploy` via `bundle run setup_masking -t <env>`
+    # -------------------------------------------------------------------------
+    setup_masking:
+      name: "[${bundle.target}] Setup: Masking Function + Tables"
+      description: >
+        One-time deploy-time job. Creates SHA-256 salted masking UDF first,
+        then config + audit tables that reference it. Idempotent — safe to re-run.
+      tags:
+        team: data-governance
+        domain: pii-masking
+        bundle: ${bundle.name}
+      permissions:
+        - group_name: "users"
+          level: "CAN_MANAGE_RUN"
+      tasks:
+        # Task 1: UDF first (tables reference it as default column value)
+        - task_key: create_masking_function
+          description: "Creates dg_metadata_catalog.db_metadata_masking.masking_function UDF"
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./sql/create_masking_function.sql
+            parameters:
+              catalog: ${var.config_catalog}
+              schema: ${var.schema}
+
+        # Task 2: Tables after UDF exists
+        - task_key: create_config_tables
+          depends_on:
+            - task_key: create_masking_function
+          description: "Idempotent DDL: creates masking_config and masking_audit_log if not exist"
+          sql_task:
+            warehouse_id: ${var.warehouse_id}
+            file:
+              path: ./sql/create_masking_tables.sql
+            parameters:
+              catalog: ${var.config_catalog}
+              schema: ${var.schema}
+
+      email_notifications:
+        on_failure:
+          - data-governance-alerts@yourcompany.com
+
+      max_concurrent_runs: 1
+
+    # -------------------------------------------------------------------------
+    # Daily Job: Apply masking policies
+    # -------------------------------------------------------------------------
+    masking_policy_manager:
+      name: "[${bundle.target}] UC Masking Policy Manager"
+      description: >
+        Daily job. Reads masking_config and applies ABAC column-masking policies.
+        Supports single-catalog or all-catalog deployment via the 'catalog' parameter.
+      tags:
+        team: data-governance
+        domain: pii-masking
+        bundle: ${bundle.name}
+      permissions:
+      - group_name: "users"
+        level: "CAN_MANAGE_RUN"
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: America/Los_Angeles
+        pause_status: PAUSED
+
+      tasks:
+        - task_key: apply_masking_policies
+          description: "Reads masking_config and applies CREATE OR REPLACE POLICY DDL to target catalog(s)"
+          notebook_task:
+            notebook_path: ./notebooks/apply_masking_policies.py
+            base_parameters:
+              catalog: ${var.catalog}
+              exclude_catalogs: ${var.exclude_catalogs}
+              config_catalog: ${var.config_catalog}
+              schema: ${var.schema}
+              masking_function: ${var.masking_function}
+              force_reapply: ${var.force_reapply}
+            source: WORKSPACE
+
+      email_notifications:
+        on_failure:
+          - data-governance-alerts@yourcompany.com
+
+      max_concurrent_runs: 1
+      queue:
+        enabled: true
