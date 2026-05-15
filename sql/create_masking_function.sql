@@ -22,13 +22,14 @@ USE SCHEMA  IDENTIFIER(:schema);
 --   STRING                       — full SHA2-256 hex digest (64 chars)
 --   BIGINT, INT                  — deterministic 7-hex pseudonym, fits INT range
 --   DOUBLE, FLOAT                — same as BIGINT/INT; decimal portion not preserved
---   DECIMAL(p,s) where p >= 9    — same numeric branch; narrower DECIMAL not supported
+--   DECIMAL(p,s) where p-s >= 9  — same as BIGINT/INT; 7-hex-digit integer pseudonym
+--   DECIMAL(p,s) where p-s < 9   — fractional pseudonym at DECIMAL(38,38) max precision, always < 1.0
 --   DATE, TIMESTAMP, TIMESTAMP_NTZ — deterministic offset within ~100 years
 --   BOOLEAN                      — collapsed to FALSE
 --
 -- OUT OF SCOPE (do not tag columns of these types with the masking tag):
 --   SMALLINT, TINYINT            — masked output exceeds declared range, cast fails
---   DECIMAL(p,s) where p < 9     — masked output exceeds declared precision
+--   DECIMAL(p,s) where p < 9 and p-s >= 9 — edge case, unlikely in practice
 --
 -- DESIGN NOTES:
 --   - schema_of_variant() collapses INT/SMALLINT/TINYINT to 'BIGINT' inside VARIANT.
@@ -53,6 +54,25 @@ CASE
 
   -- Empty string pass-through (only meaningful for STRING variants)
   WHEN SCHEMA_OF_VARIANT(value) = 'STRING' AND CAST(value AS STRING) = '' THEN value
+
+  -- DECIMAL(p,s) where the integer portion (p - s) is too narrow for the 7-hex-digit
+  -- masked integer (max 268,435,455 = 9 digits). Produce a fractional pseudonym instead.
+  -- Uses max precision DECIMAL(38,38): two 15-hex-char hash chunks → 19 decimal digits each
+  -- → 38-digit fractional value always < 1.0. UC engine truncates to column's actual type.
+  -- Covers DECIMAL(18,18), DECIMAL(38,38), DECIMAL(25,20), and all high-scale variants.
+  WHEN SCHEMA_OF_VARIANT(value) LIKE 'DECIMAL%'
+       AND (
+         CAST(REGEXP_EXTRACT(SCHEMA_OF_VARIANT(value), 'DECIMAL\\((\\d+),(\\d+)\\)', 1) AS INT)
+         - CAST(REGEXP_EXTRACT(SCHEMA_OF_VARIANT(value), 'DECIMAL\\((\\d+),(\\d+)\\)', 2) AS INT)
+       ) < 9 THEN
+    CAST(
+      CAST(
+        CONCAT('0.',
+          LPAD(CONV(SUBSTRING(SHA2(CONCAT(CAST(value AS STRING), secret('masking','pii-salt')), 256),  1, 15), 16, 10), 19, '0'),
+          LPAD(CONV(SUBSTRING(SHA2(CONCAT(CAST(value AS STRING), secret('masking','pii-salt')), 256), 16, 15), 16, 10), 19, '0')
+        )
+      AS DECIMAL(38,38))
+    AS VARIANT)
 
   -- All integer types collapse to 'BIGINT' inside VARIANT (per Databricks behavior).
   -- Sized to fit INT range (7 hex digits → max 268,435,455).
