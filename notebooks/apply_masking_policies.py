@@ -29,6 +29,7 @@ dbutils.widgets.text("schema", "db_metadata_masking", "Schema")
 dbutils.widgets.text("masking_function", "dg_metadata_catalog.db_metadata_masking.masking_function", "Masking UDF")
 dbutils.widgets.dropdown("force_reapply", "false", ["true", "false"], "Force re-apply existing policies")
 dbutils.widgets.text("tag_key_value_pairs", "", "Catalog Tags (comma-separated key:value pairs, positional with catalogs)")
+dbutils.widgets.dropdown("enable_data_classification", "true", ["true", "false"], "Enable UC Data Classification on target catalogs")
 
 catalog_param       = dbutils.widgets.get("catalog").strip()
 exclude_catalogs    = {c.strip().lower() for c in dbutils.widgets.get("exclude_catalogs").split(",") if c.strip()}
@@ -37,6 +38,7 @@ schema              = dbutils.widgets.get("schema")
 masking_function    = dbutils.widgets.get("masking_function")
 force_reapply       = dbutils.widgets.get("force_reapply").lower() == "true"
 tag_kvp_param       = dbutils.widgets.get("tag_key_value_pairs").strip()
+enable_classification = dbutils.widgets.get("enable_data_classification").lower() == "true"
 
 # Derive environment from workspace URL (e.g. nyl-builder-dev.cloud.databricks.com → dev)
 workspace_url = spark.conf.get("spark.databricks.workspaceUrl")
@@ -49,6 +51,7 @@ print(f"Schema              : {schema}")
 print(f"Masking Function    : {masking_function}")
 print(f"Force Re-apply      : {force_reapply}")
 print(f"Tag Key-Value Pairs : {tag_kvp_param if tag_kvp_param else '(none)'}")
+print(f"Data Classification : {'enable' if enable_classification else 'skip'}")
 print(f"Environment         : {env} (from workspace URL: {workspace_url})")
 
 # COMMAND ----------
@@ -278,6 +281,63 @@ else:
 
 # COMMAND ----------
 
+# DBTITLE 1,Enable Data Classification (optional)
+# Enables the UC Data Classification feature on each target catalog via the
+# Data Classification API (databricks-sdk). The agentic background scan then
+# detects PII and populates the class.* tags that the masking policies above
+# match on. Idempotent: a catalog already configured is left untouched.
+classification_results = []
+
+if enable_classification:
+    from databricks.sdk.service.dataclassification import CatalogConfig
+    from databricks.sdk.errors import NotFound
+
+    print(f"\n{'='*60}")
+    print(f"DATA CLASSIFICATION")
+    print(f"{'='*60}")
+
+    for catalog in target_catalogs:
+        parent = f"catalogs/{catalog}"
+        config_name = f"{parent}/config"
+        try:
+            _w.data_classification.get_catalog_config(name=config_name)
+            action = "CLASSIFICATION_EXISTS"
+            error_message = None
+            print(f"  {catalog}: already enabled — skipping")
+        except NotFound:
+            try:
+                # included_schemas omitted => scan all schemas (empty list is rejected by the API)
+                _w.data_classification.create_catalog_config(
+                    parent=parent,
+                    catalog_config=CatalogConfig(),
+                )
+                action = "CLASSIFICATION_ENABLED"
+                error_message = None
+                print(f"  {catalog}: ENABLED")
+            except Exception as e:
+                action = "CLASSIFICATION_FAILED"
+                error_message = str(e)[:2000]
+                print(f"  {catalog}: FAILED — {error_message}")
+        except Exception as e:
+            action = "CLASSIFICATION_FAILED"
+            error_message = str(e)[:2000]
+            print(f"  {catalog}: FAILED — {error_message}")
+
+        classification_results.append({
+            "col_name": "DATA_CLASSIFICATION",
+            "catalog_name": catalog,
+            "environment": env,
+            "action": action,
+            "policy_sql": None,
+            "error_message": error_message,
+        })
+
+    results.extend(classification_results)
+else:
+    print("\nenable_data_classification = false — skipping Data Classification.")
+
+# COMMAND ----------
+
 # DBTITLE 1,Write audit log
 from pyspark.sql.types import StructType, StructField, StringType
 from pyspark.sql.functions import current_user, current_timestamp
@@ -305,12 +365,15 @@ display(audit_df)
 # COMMAND ----------
 
 # DBTITLE 1,Summary
-failed       = [r for r in results if r["action"] == "FAILED"]
-applied      = [r for r in results if r["action"] == "APPLIED"]
-skipped      = [r for r in results if r["action"] == "SKIPPED"]
-tags_applied = [r for r in results if r["action"] == "TAG_APPLIED"]
-tags_failed  = [r for r in results if r["action"] == "TAG_FAILED"]
-all_failures = failed + tags_failed
+failed         = [r for r in results if r["action"] == "FAILED"]
+applied        = [r for r in results if r["action"] == "APPLIED"]
+skipped        = [r for r in results if r["action"] == "SKIPPED"]
+tags_applied   = [r for r in results if r["action"] == "TAG_APPLIED"]
+tags_failed    = [r for r in results if r["action"] == "TAG_FAILED"]
+class_enabled  = [r for r in results if r["action"] == "CLASSIFICATION_ENABLED"]
+class_exists   = [r for r in results if r["action"] == "CLASSIFICATION_EXISTS"]
+class_failed   = [r for r in results if r["action"] == "CLASSIFICATION_FAILED"]
+all_failures = failed + tags_failed + class_failed
 
 print(f"\n{'='*60}")
 print(f"SUMMARY")
@@ -322,6 +385,7 @@ print(f"Policies skipped  : {len(skipped)}")
 print(f"Policies failed   : {len(failed)}")
 print(f"Tags applied      : {len(tags_applied)}")
 print(f"Tags failed       : {len(tags_failed)}")
+print(f"Classification on : {len(class_enabled)} enabled, {len(class_exists)} already on, {len(class_failed)} failed")
 
 if all_failures:
     print(f"\nFailures:")
@@ -332,6 +396,6 @@ if all_failures:
     # Optionally raise to fail the DABs job and trigger email notification
     # dbutils.notebook.exit(msg)
 else:
-    msg = f"SUCCESS: {len(applied)} policies applied, {len(tags_applied)} tags applied across {len(target_catalogs)} catalogs"
+    msg = f"SUCCESS: {len(applied)} policies applied, {len(tags_applied)} tags applied, {len(class_enabled)} catalogs classification-enabled across {len(target_catalogs)} catalogs"
     print(f"\n{msg}")
     dbutils.notebook.exit(msg)

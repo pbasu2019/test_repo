@@ -44,6 +44,9 @@ variables:
   force_reapply:
     description: "Force re-apply existing policies (true/false)"
     default: "false"
+  enable_data_classification:
+    description: "Enable UC Data Classification on target catalogs (true/false)"
+    default: "true"
   tag_key_value_pairs:
     description: "Optional comma-separated tag key:value pairs applied positionally to catalogs (e.g. org:fb_product_solutions,class_sensitivity:internal)"
     default: ""
@@ -141,6 +144,8 @@ resources:
       description: >
         Daily job. Reads masking_config and applies ABAC column-masking policies.
         Optionally applies UC catalog-level tags via the 'tag_key_value_pairs' parameter.
+        Optionally enables UC Data Classification on target catalogs via the
+        'enable_data_classification' parameter.
         Supports single-catalog or all-catalog deployment via the 'catalog' parameter.
       tags:
         team: data-governance
@@ -167,6 +172,7 @@ resources:
               masking_function: ${var.masking_function}
               force_reapply: ${var.force_reapply}
               tag_key_value_pairs: ${var.tag_key_value_pairs}
+              enable_data_classification: ${var.enable_data_classification}
             source: WORKSPACE
 
       email_notifications:
