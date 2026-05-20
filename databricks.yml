@@ -159,9 +159,20 @@ resources:
         timezone_id: America/Los_Angeles
         pause_status: PAUSED
 
+      # Serverless environment: pins latest databricks-sdk so the notebook can
+      # import databricks.sdk.service.dataclassification (introduced in newer
+      # SDK releases and not present on default DBR-bundled SDK).
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+            dependencies:
+              - databricks-sdk
+
       tasks:
         - task_key: apply_masking_policies
           description: "Reads masking_config and applies CREATE OR REPLACE POLICY DDL to target catalog(s)"
+          environment_key: default
           notebook_task:
             notebook_path: ./notebooks/apply_masking_policies.py
             base_parameters:
