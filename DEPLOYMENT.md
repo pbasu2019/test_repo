@@ -20,6 +20,8 @@ databricks secrets put-secret masking pii-salt --string-value $salt
 #    - CREATE POLICY on all target catalogs
 #    - SELECT on system.information_schema.policies
 #    - ALL PRIVILEGES on dg_metadata_catalog.db_metadata_masking
+#    - For Data Classification: catalog ownership OR (USE CATALOG + MANAGE) on each target catalog
+#    - Workspace must have serverless compute enabled (default in UC-enabled workspaces)
 ```
 
 ## Set warehouse_id once per session
@@ -58,7 +60,10 @@ DESCRIBE FUNCTION dg_metadata_catalog_dev.db_metadata_masking.masking_function;
 # 7. Test on single catalog first
 databricks bundle run masking_policy_manager -t dev --params "catalog=cl_test_dev"
 
-# 8. Check audit log
+# 8. Check audit log — includes policy, tag, and Data Classification actions:
+#    APPLIED / SKIPPED / FAILED                       (masking policies)
+#    TAG_APPLIED / TAG_FAILED                         (catalog tags)
+#    CLASSIFICATION_ENABLED / _EXISTS / _FAILED       (Data Classification)
 databricks sql execute --warehouse-id $env:WID --query @"
 SELECT action, COUNT(*) FROM dg_metadata_catalog_dev.db_metadata_masking.masking_audit_log
 WHERE executed_at > current_timestamp() - INTERVAL 1 HOUR
@@ -67,7 +72,22 @@ GROUP BY action;
 
 # 9. Run on ALL catalogs
 databricks bundle run masking_policy_manager -t dev
+
+# 9a. Opt out of Data Classification for a single run (default is on)
+databricks bundle run masking_policy_manager -t dev --params "enable_data_classification=false"
 ```
+
+### Data Classification
+
+The job calls the UC Data Classification API (`databricks-sdk` `DataClassificationAPI`)
+on each target catalog. Behavior:
+
+- Controlled by the `enable_data_classification` parameter (bundle var default `true`).
+- Idempotent: catalogs already configured report `CLASSIFICATION_EXISTS` and are skipped.
+- Scans all schemas; auto-tagging is not enabled by default.
+- Failures (e.g. missing privileges, serverless unavailable) record `CLASSIFICATION_FAILED`
+  and fail the job so the on_failure email fires.
+- Requires catalog ownership or `USE CATALOG` + `MANAGE` on each target catalog.
 
 ## Activate Schedule
 
