@@ -1,0 +1,14 @@
+Hi 
+
+We need your approval before a permissions change on the governance/masking pipeline.
+
+Background: the ABAC column-masking pipeline runs under the selfscanner service principal. To apply masking policies, the SP needs Manage access on the target catalogs. Today selfscanner only has Manage on catalogs deployed through Terraform — it can't act on catalogs created manually. We confirmed in testing that masking policies apply correctly once the SP has Manage (validated with dbx_governance_svcpl on a manually-created catalog).
+
+Proposed change: add the selfscanner SP to the metastore admin group so it has Manage across all catalogs, regardless of how they were provisioned.
+
+Why we're flagging it: metastore admin is a top-tier permission spanning the entire metastore, so we don't want to proceed without your explicit sign-off. This would apply to Dev only for now — we'll come back for separate approval before extending to QA and Prod.
+
+Can you confirm you're OK with us adding selfscanner to the metastore admin group in Dev?
+
+Thanks,
+Paulam
